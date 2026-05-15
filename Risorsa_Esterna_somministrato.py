@@ -13,8 +13,23 @@ def load_config_from_bytes(data: bytes):
     # Carica tutti i fogli del workbook
     cfg_sheets = pd.read_excel(io.BytesIO(data), sheet_name=None, engine="openpyxl")
 
-    # Estrai configurazione Somministrato
+    # Estrai configurazione Somministrato (SEMPRE questo sheet)
     sommin = cfg_sheets.get("Somministrato")
+    if sommin is None:
+        # Manteniamo comportamento robusto: se manca, DataFrame vuoto (poi andrà in errore come prima sulle colonne)
+        sommin = pd.DataFrame()
+
+    # Normalizzazione colonne (non cambia funzionalità, solo robustezza)
+    if not sommin.empty:
+        cols = {c: c.strip() for c in sommin.columns}
+        sommin = sommin.rename(columns=cols)
+        # Gestisce "Tipo"/"TIPO"
+        if "Tipo" in sommin.columns and "TIPO" not in sommin.columns:
+            sommin = sommin.rename(columns={"Tipo": "TIPO"})
+        for col in ["Section", "Key/App", "Label/Gruppi/Value", "TIPO"]:
+            if col in sommin.columns:
+                sommin[col] = sommin[col].fillna("").astype(str).str.strip()
+
     grp_df = (
         sommin[sommin["Section"] == "InserimentoGruppi"]
         [["Key/App", "Label/Gruppi/Value"]]
@@ -28,6 +43,18 @@ def load_config_from_bytes(data: bytes):
         .rename(columns={"Key/App": "key", "Label/Gruppi/Value": "value"})
     )
     defaults = dict(zip(def_df["key"], def_df["value"]))
+
+    # ✅ NUOVO: prendo TUTTE le righe Defaults con TIPO=PEL (ordine foglio)
+    pel_items = []
+    if not sommin.empty and "TIPO" in sommin.columns:
+        pel_df = sommin[(sommin["Section"] == "Defaults") & (sommin["TIPO"].str.upper() == "PEL")][
+            ["Key/App", "Label/Gruppi/Value"]
+        ]
+        for _, r in pel_df.iterrows():
+            k = str(r["Key/App"]).strip()
+            v = str(r["Label/Gruppi/Value"]).strip()
+            if v:
+                pel_items.append((k, v))
 
     # Estrai opzioni manager dal foglio RA-RD
     rd_sheet = cfg_sheets.get("RA-RD")
@@ -45,7 +72,7 @@ def load_config_from_bytes(data: bytes):
         org.columns = ["label", "value"]
         organigramma = dict(zip(org["label"], org["value"]))
 
-    return gruppi, defaults, managers, organigramma
+    return gruppi, defaults, managers, organigramma, pel_items
 
 # ------------------------------------------------------------
 # Utility functions
@@ -132,6 +159,33 @@ def make_csv_buffer(headers, row):
     return buf
 
 # ------------------------------------------------------------
+# Helper: costruzione dinamica PEL per Template Posta
+# ------------------------------------------------------------
+def build_dynamic_pel_for_template(pel_items):
+    """
+    Regola:
+    - 'pillole' viene resa come "- canale ...".
+    - Tutte le altre PEL diventano righe sotto "Aggiungere utenza al gruppo Azure".
+    - Ordine = ordine nel foglio Excel.
+    """
+    azure_groups = []
+    pillole_value = ""
+
+    for k, v in pel_items:
+        key = str(k).strip()
+        val = str(v).strip()
+        if not val:
+            continue
+
+        if key == "pillole":
+            pillole_value = val
+            continue
+
+        azure_groups.append(val)
+
+    return azure_groups, pillole_value
+
+# ------------------------------------------------------------
 # Streamlit App
 # ------------------------------------------------------------
 st.set_page_config(page_title="1.2 Risorsa Esterna: Somministrato/Stage")
@@ -143,9 +197,9 @@ if not config_file:
     st.stop()
 
 # Carica configurazione
-gruppi, defaults, managers, organigramma = load_config_from_bytes(config_file.read())
+gruppi, defaults, managers, organigramma, pel_items = load_config_from_bytes(config_file.read())
 
-# Valori di default
+# Valori di default (NON CAMBIATI)
 o365_groups = [
     defaults.get("grp_o365_standard","O365 Utenti Standard"),
     defaults.get("grp_o365_teams","O365 Teams Premium"),
@@ -218,11 +272,21 @@ Richiedo la definizione di una casella come sottoindicato.
 """
     st.markdown(table_md)
     st.markdown("** il campo \"Data fine\" deve essere inserito in \"Data Assunzione\" **")
-    st.markdown(f"Aggiungere utenza al gruppo Azure: \n- {grp_foorban}\n- {grp_salesforce}\n- canale {pillole}")
+
+    # ✅ NUOVO: PEL dinamici dal config (aggiunte future automatiche)
+    azure_groups, pillole_dyn = build_dynamic_pel_for_template(pel_items)
+    lines = ["Aggiungere utenza al gruppo Azure:"]
+    for g in azure_groups:
+        lines.append(f"- {g}")
+    if pillole_dyn:
+        lines.append(f"- canale {pillole_dyn}")
+    st.markdown("\n".join(lines))
+
     if profilazione_flag:
         st.markdown("Profilare su SM:")
         for sm in sm_lines:
-            if sm.strip(): st.markdown(f"- {sm}")
+            if sm.strip():
+                st.markdown(f"- {sm}")
     st.markdown("Grazie  \nSaluti")
 
 # Generazione CSV Utente + Computer + Profilazione
@@ -375,12 +439,14 @@ if st.button("Genera CSV Somministrato"):
         for sm in sm_lines:
             template_preview_lines.append(f"- {sm}\n")
 
-    if grp_foorban:
-        template_preview_lines.append(f"\nAggiungere utenza al gruppo Azure:\n- {grp_foorban}\n")
-    if grp_salesforce:
-        template_preview_lines.append(f"- {grp_salesforce}\n")
-    if pillole:
-        template_preview_lines.append(f"- canale {pillole}\n")
+    # ✅ NUOVO: PEL dinamici anche nella preview ZIP (stessa identica logica del template a video)
+    azure_groups, pillole_dyn = build_dynamic_pel_for_template(pel_items)
+    if azure_groups:
+        template_preview_lines.append("\nAggiungere utenza al gruppo Azure:\n")
+        for g in azure_groups:
+            template_preview_lines.append(f"- {g}\n")
+    if pillole_dyn:
+        template_preview_lines.append(f"- canale {pillole_dyn}\n")
 
     # unisco tutto in una stringa markdown
     template_preview_md = "\n".join(template_preview_lines)
