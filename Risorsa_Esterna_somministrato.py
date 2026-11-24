@@ -1466,21 +1466,16 @@ if st.button(
     # Foto + SIC + Accesso intranet PSN
     # ========================================================
     subject_ga = (
-        "04 - Caricamento Foto, Verifica SIC e "
-        "Accesso intranet PSN - "
+        "04 - Verifica SIC - "
         f"{cn} → GA"
     )
 
     message_ga = (
         "Ciao,\n"
         "si richiedono le seguenti attività:\n"
-        f"1. Caricare la foto in allegato per {cn}.\n"
-        f"2. Verificare che per l'utente {cn} "
+        f"1. Verificare che per l'utente {cn} "
         "sia indicata sul SIC la seguente email: "
         f'"{upn}".\n'
-        "3. Accesso intranet PSN: attività "
-        "momentaneamente esclusa dal flusso, "
-        "perché attualmente gestita via email."
     )
 
     # ========================================================
