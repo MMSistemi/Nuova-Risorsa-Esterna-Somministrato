@@ -6,476 +6,1794 @@ import io
 import unicodedata
 import zipfile
 
+
 # ------------------------------------------------------------
-# Caricamento configurazione da Excel caricato dall'utente
+# Caricamento configurazione da Excel
 # ------------------------------------------------------------
 def load_config_from_bytes(data: bytes):
-    # Carica tutti i fogli del workbook
-    cfg_sheets = pd.read_excel(io.BytesIO(data), sheet_name=None, engine="openpyxl")
-
-    # Estrai configurazione Somministrato (SEMPRE questo sheet)
-    sommin = cfg_sheets.get("Somministrato")
-    if sommin is None:
-        # Manteniamo comportamento robusto: se manca, DataFrame vuoto (poi andrà in errore come prima sulle colonne)
-        sommin = pd.DataFrame()
-
-    # Normalizzazione colonne (non cambia funzionalità, solo robustezza)
-    if not sommin.empty:
-        cols = {c: c.strip() for c in sommin.columns}
-        sommin = sommin.rename(columns=cols)
-        # Gestisce "Tipo"/"TIPO"
-        if "Tipo" in sommin.columns and "TIPO" not in sommin.columns:
-            sommin = sommin.rename(columns={"Tipo": "TIPO"})
-        for col in ["Section", "Key/App", "Label/Gruppi/Value", "TIPO"]:
-            if col in sommin.columns:
-                sommin[col] = sommin[col].fillna("").astype(str).str.strip()
-
-    grp_df = (
-        sommin[sommin["Section"] == "InserimentoGruppi"]
-        [["Key/App", "Label/Gruppi/Value"]]
-        .rename(columns={"Key/App": "app", "Label/Gruppi/Value": "gruppi"})
+    cfg = pd.read_excel(
+        io.BytesIO(data),
+        sheet_name=None,
+        engine="openpyxl"
     )
-    gruppi = dict(zip(grp_df["app"], grp_df["gruppi"]))
 
-    def_df = (
-        sommin[sommin["Section"] == "Defaults"]
-        [["Key/App", "Label/Gruppi/Value"]]
-        .rename(columns={"Key/App": "key", "Label/Gruppi/Value": "value"})
+    ris = cfg.get(
+        "Somministrato",
+        pd.DataFrame()
     )
-    defaults = dict(zip(def_df["key"], def_df["value"]))
 
-    # ✅ NUOVO: prendo TUTTE le righe Defaults con TIPO=PEL (ordine foglio)
-    pel_items = []
-    if not sommin.empty and "TIPO" in sommin.columns:
-        pel_df = sommin[(sommin["Section"] == "Defaults") & (sommin["TIPO"].str.upper() == "PEL")][
-            ["Key/App", "Label/Gruppi/Value"]
+    # --------------------------------------------------------
+    # Normalizzazione colonne
+    # --------------------------------------------------------
+    if not ris.empty:
+
+        ris = ris.rename(
+            columns={
+                column: str(column).strip()
+                for column in ris.columns
+            }
+        )
+
+        if "Tipo" in ris.columns and "TIPO" not in ris.columns:
+
+            ris = ris.rename(
+                columns={
+                    "Tipo": "TIPO"
+                }
+            )
+
+        for column in [
+            "Section",
+            "Key/App",
+            "Label/Gruppi/Value",
+            "TIPO"
+        ]:
+
+            if column in ris.columns:
+
+                ris[column] = (
+                    ris[column]
+                    .fillna("")
+                    .astype(str)
+                    .str.strip()
+                )
+
+    required_columns = {
+        "Section",
+        "Key/App",
+        "Label/Gruppi/Value"
+    }
+
+    if (
+        not ris.empty
+        and required_columns.issubset(ris.columns)
+    ):
+
+        # ----------------------------------------------------
+        # OU
+        # ----------------------------------------------------
+        ou_df = ris[
+            ris["Section"] == "OU"
+        ][
+            [
+                "Key/App",
+                "Label/Gruppi/Value"
+            ]
         ]
-        for _, r in pel_df.iterrows():
-            k = str(r["Key/App"]).strip()
-            v = str(r["Label/Gruppi/Value"]).strip()
-            if v:
-                pel_items.append((k, v))
 
-    # Estrai opzioni manager dal foglio RA-RD
-    rd_sheet = cfg_sheets.get("RA-RD")
+        ou_options = dict(
+            zip(
+                ou_df["Key/App"],
+                ou_df["Label/Gruppi/Value"]
+            )
+        )
+
+        # ----------------------------------------------------
+        # Inserimento gruppi
+        # ----------------------------------------------------
+        gruppi_df = ris[
+            ris["Section"] == "InserimentoGruppi"
+        ][
+            [
+                "Key/App",
+                "Label/Gruppi/Value"
+            ]
+        ]
+
+        gruppi = dict(
+            zip(
+                gruppi_df["Key/App"],
+                gruppi_df["Label/Gruppi/Value"]
+            )
+        )
+
+        # ----------------------------------------------------
+        # Defaults
+        # ----------------------------------------------------
+        defaults_df = ris[
+            ris["Section"] == "Defaults"
+        ][
+            [
+                "Key/App",
+                "Label/Gruppi/Value"
+            ]
+        ]
+
+        defaults = dict(
+            zip(
+                defaults_df["Key/App"],
+                defaults_df["Label/Gruppi/Value"]
+            )
+        )
+
+    else:
+
+        ou_options = {}
+        gruppi = {}
+        defaults = {}
+
+    # --------------------------------------------------------
+    # Estrazione righe Defaults con TIPO = PEL
+    # --------------------------------------------------------
+    pel_items = []
+
+    if (
+        not ris.empty
+        and required_columns.issubset(ris.columns)
+        and "TIPO" in ris.columns
+    ):
+
+        pel_df = ris[
+            (
+                ris["Section"] == "Defaults"
+            )
+            & (
+                ris["TIPO"].str.upper() == "PEL"
+            )
+        ][
+            [
+                "Key/App",
+                "Label/Gruppi/Value"
+            ]
+        ]
+
+        for _, row in pel_df.iterrows():
+
+            key = str(
+                row["Key/App"]
+            ).strip()
+
+            value = str(
+                row["Label/Gruppi/Value"]
+            ).strip()
+
+            if value:
+
+                pel_items.append(
+                    (
+                        key,
+                        value
+                    )
+                )
+
+    # --------------------------------------------------------
+    # Estrazione Manager dal foglio RA-RD
+    # --------------------------------------------------------
     managers = {}
-    if rd_sheet is not None:
-        rd = rd_sheet.iloc[:, :2].dropna(how="all")
-        rd.columns = ["label", "value"]
-        managers = dict(zip(rd["label"], rd["value"]))
 
-    # Estrai organigramma
-    org_sheet = cfg_sheets.get("organigramma")
+    if "RA-RD" in cfg:
+
+        manager_df = (
+            cfg["RA-RD"]
+            .iloc[:, :2]
+            .dropna(how="all")
+        )
+
+        manager_df.columns = [
+            "label",
+            "value"
+        ]
+
+        managers = dict(
+            zip(
+                manager_df["label"],
+                manager_df["value"]
+            )
+        )
+
+    # --------------------------------------------------------
+    # Estrazione organigramma
+    # --------------------------------------------------------
     organigramma = {}
-    if org_sheet is not None:
-        org = org_sheet.iloc[:, :2].dropna(how="all")
-        org.columns = ["label", "value"]
-        organigramma = dict(zip(org["label"], org["value"]))
 
-    return gruppi, defaults, managers, organigramma, pel_items
+    if "organigramma" in cfg:
+
+        organigramma_df = (
+            cfg["organigramma"]
+            .iloc[:, :2]
+            .dropna(how="all")
+        )
+
+        organigramma_df.columns = [
+            "label",
+            "value"
+        ]
+
+        organigramma = dict(
+            zip(
+                organigramma_df["label"],
+                organigramma_df["value"]
+            )
+        )
+
+    return (
+        ou_options,
+        gruppi,
+        defaults,
+        managers,
+        organigramma,
+        pel_items
+    )
+
 
 # ------------------------------------------------------------
-# Utility functions
+# Configurazione pagina
 # ------------------------------------------------------------
-def auto_quote(fields, quotechar='"', predicate=lambda s: ' ' in s):
-    out = []
-    for f in fields:
-        s = str(f)
-        if predicate(s):
-            out.append(f'{quotechar}{s}{quotechar}')
-        else:
-            out.append(s)
-    return out
-    
+st.set_page_config(
+    page_title="1.2 Nuova Risorsa Esterna: Somministrato/Stage",
+    layout="wide"
+)
 
-def normalize_name(s: str) -> str:
-    """Rimuove spazi, apostrofi e accenti, restituisce in minuscolo."""
-    nfkd = unicodedata.normalize('NFKD', s)
-    ascii_str = nfkd.encode('ASCII', 'ignore').decode()
-    return ascii_str.replace(' ', '').replace("'", '').lower()
+st.title(
+    "1.2 Nuova Risorsa Esterna: Somministrato/Stage"
+)
+
+
+# ------------------------------------------------------------
+# Caricamento file di configurazione
+# ------------------------------------------------------------
+config_file = st.file_uploader(
+    "Carica il file di configurazione (config.xlsx)",
+    type=["xlsx"],
+    help=(
+        "Il file deve contenere il foglio "
+        "'Somministrato'."
+    )
+)
+
+if not config_file:
+
+    st.warning(
+        "Per favore carica il file di configurazione "
+        "per continuare."
+    )
+
+    st.stop()
+
+
+(
+    ou_options,
+    gruppi,
+    defaults,
+    managers,
+    organigramma,
+    pel_items
+) = load_config_from_bytes(
+    config_file.read()
+)
+
+
+# ------------------------------------------------------------
+# Funzioni di gestione configurazione
+# ------------------------------------------------------------
+def split_values(value):
+
+    return [
+        item.strip()
+        for item in str(value).split(";")
+        if item.strip()
+    ]
+
+
+def unique_in_order(values):
+
+    result = []
+
+    for value in values:
+
+        value = str(value).strip()
+
+        if value and value not in result:
+
+            result.append(
+                value
+            )
+
+    return result
+
+
+# ------------------------------------------------------------
+# Funzioni di utilità
+# ------------------------------------------------------------
+def normalize_name(value: str) -> str:
+
+    normalized = unicodedata.normalize(
+        "NFKD",
+        value
+    )
+
+    ascii_value = (
+        normalized
+        .encode(
+            "ASCII",
+            "ignore"
+        )
+        .decode()
+    )
+
+    return (
+        ascii_value
+        .replace(" ", "")
+        .replace("'", "")
+        .lower()
+    )
 
 
 def formatta_data(data: str) -> str:
-    for sep in ["-", "/"]:
+
+    for formato in (
+        "%d-%m-%Y",
+        "%d/%m/%Y"
+    ):
+
         try:
-            g, m, a = map(int, data.split(sep))
-            dt = datetime(a, m, g) + timedelta(days=1)
-            return dt.strftime("%m/%d/%Y 00:00")
-        except:
+
+            data_convertita = (
+                datetime.strptime(
+                    data,
+                    formato
+                )
+                + timedelta(days=1)
+            )
+
+            return data_convertita.strftime(
+                "%m/%d/%Y 00:00"
+            )
+
+        except ValueError:
+
             continue
+
     return data
 
-# ------------------------------------------------------------
-# Generazione SAMAccountName
-# ------------------------------------------------------------
-def genera_samaccountname(nome: str, cognome: str,
-                          secondo_nome: str = "", secondo_cognome: str = "",
-                          esterno: bool = True) -> str:
-    n, sn = normalize_name(nome), normalize_name(secondo_nome)
-    c, sc = normalize_name(cognome), normalize_name(secondo_cognome)
+
+def genera_samaccountname(
+    nome,
+    cognome,
+    secondo_nome="",
+    secondo_cognome="",
+    esterno=True
+):
+
+    nome_normalizzato = normalize_name(
+        nome
+    )
+
+    secondo_nome_normalizzato = normalize_name(
+        secondo_nome
+    )
+
+    cognome_normalizzato = normalize_name(
+        cognome
+    )
+
+    secondo_cognome_normalizzato = normalize_name(
+        secondo_cognome
+    )
+
     suffix = ".ext" if esterno else ""
-    limit  = 16 if esterno else 20
 
-    cand1 = f"{n}{sn}.{c}{sc}"
-    if len(cand1) <= limit:
-        return cand1 + suffix
-    cand2 = f"{n[:1]}{sn[:1]}.{c}{sc}"
-    if len(cand2) <= limit:
-        return cand2 + suffix
-    base = f"{n[:1]}{sn[:1]}.{c}"
-    return base[:limit] + suffix
+    # Per gli esterni:
+    # massimo 16 caratteri della parte base + ".ext"
+    # totale massimo prima della @ = 20 caratteri
+    limit = 16 if esterno else 20
+
+    candidate_1 = (
+        f"{nome_normalizzato}"
+        f"{secondo_nome_normalizzato}."
+        f"{cognome_normalizzato}"
+        f"{secondo_cognome_normalizzato}"
+    )
+
+    if len(candidate_1) <= limit:
+
+        return (
+            candidate_1
+            + suffix
+        )
+
+    candidate_2 = (
+        f"{nome_normalizzato[:1]}"
+        f"{secondo_nome_normalizzato[:1]}."
+        f"{cognome_normalizzato}"
+        f"{secondo_cognome_normalizzato}"
+    )
+
+    if len(candidate_2) <= limit:
+
+        return (
+            candidate_2
+            + suffix
+        )
+
+    base = (
+        f"{nome_normalizzato[:1]}"
+        f"{secondo_nome_normalizzato[:1]}."
+        f"{cognome_normalizzato}"
+    )
+
+    return (
+        base[:limit]
+        + suffix
+    )
+
+
+def build_full_name(
+    cognome,
+    secondo_cognome,
+    nome,
+    secondo_nome,
+    esterno=True
+):
+
+    parts = [
+        part
+        for part in [
+            cognome,
+            secondo_cognome,
+            nome,
+            secondo_nome
+        ]
+        if part
+    ]
+
+    full_name = " ".join(
+        parts
+    )
+
+    if esterno:
+
+        full_name += " (esterno)"
+
+    return full_name
+
 
 # ------------------------------------------------------------
-# Costruzione nome completo
+# Costruzione gruppi Entra ID
 # ------------------------------------------------------------
-def build_full_name(cognome: str, secondo_cognome: str,
-                    nome: str, secondo_nome: str,
-                    esterno: bool = True) -> str:
-    parts = [p for p in [cognome, secondo_cognome, nome, secondo_nome] if p]
-    return " ".join(parts) + (" (esterno)" if esterno else "")
+def build_entraid_groups(
+    pel_items
+):
+
+    entra_groups = []
+
+    for key, value in pel_items:
+
+        key = str(
+            key
+        ).strip()
+
+        value = str(
+            value
+        ).strip()
+
+        if not value:
+
+            continue
+
+        # Questi elementi non sono gruppi Entra ID
+        if key in (
+            "dl_standard",
+            "dl_vip",
+            "dl_interinale",
+            "dl_somministrato",
+            "pillole"
+        ):
+
+            continue
+
+        entra_groups.extend(
+            split_values(
+                value
+            )
+        )
+
+    return unique_in_order(
+        entra_groups
+    )
+
+
+def get_pillole(
+    pel_items,
+    defaults
+):
+
+    for key, value in pel_items:
+
+        if (
+            str(key).strip() == "pillole"
+            and str(value).strip()
+        ):
+
+            return str(
+                value
+            ).strip()
+
+    return str(
+        defaults.get(
+            "pillole",
+            ""
+        )
+    ).strip()
+
+
+# ------------------------------------------------------------
+# Costruzione CSV
+# ------------------------------------------------------------
+def auto_quote(
+    fields,
+    quotechar='"',
+    predicate=lambda value: " " in value
+):
+
+    output = []
+
+    for field in fields:
+
+        value = str(
+            field
+        )
+
+        if predicate(value):
+
+            output.append(
+                f'{quotechar}{value}{quotechar}'
+            )
+
+        else:
+
+            output.append(
+                value
+            )
+
+    return output
+
+
+def prepara_csv_standard(
+    row,
+    header
+):
+
+    buffer = io.StringIO()
+
+    writer = csv.writer(
+        buffer,
+        quoting=csv.QUOTE_NONE,
+        escapechar="\\",
+        lineterminator="\n"
+    )
+
+    quoted_row = auto_quote(
+        row,
+        quotechar='"',
+        predicate=lambda value: " " in value
+    )
+
+    writer.writerow(
+        header
+    )
+
+    writer.writerow(
+        quoted_row
+    )
+
+    return buffer.getvalue()
+
 
 # ------------------------------------------------------------
 # Header CSV
 # ------------------------------------------------------------
-HEADER_USER = [
-    "sAMAccountName","Creation","OU","Name","DisplayName","cn","GivenName","Surname",
-    "employeeNumber","employeeID","department","Description","passwordNeverExpired",
-    "ExpireDate","userprincipalname","mail","mobile","RimozioneGruppo","InserimentoGruppo",
-    "disable","moveToOU","telephoneNumber","company"
+HEADER_UTENTE = [
+    "sAMAccountName",
+    "Creation",
+    "OU",
+    "Name",
+    "DisplayName",
+    "cn",
+    "GivenName",
+    "Surname",
+    "employeeNumber",
+    "employeeID",
+    "department",
+    "Description",
+    "passwordNeverExpired",
+    "ExpireDate",
+    "userprincipalname",
+    "mail",
+    "mobile",
+    "RimozioneGruppo",
+    "InserimentoGruppo",
+    "disable",
+    "moveToOU",
+    "telephoneNumber",
+    "company"
 ]
-HEADER_COMP = [
-    "Computer","OU","add_mail","remove_mail","add_mobile","remove_mobile",
-    "add_userprincipalname","remove_userprincipalname","disable","moveToOU"
+
+
+HEADER_COMPUTER = [
+    "Computer",
+    "OU",
+    "add_mail",
+    "remove_mail",
+    "add_mobile",
+    "remove_mobile",
+    "add_userprincipalname",
+    "remove_userprincipalname",
+    "disable",
+    "moveToOU"
 ]
 
-# helper per creare buffer CSV
-def make_csv_buffer(headers, row):
-    buf = io.StringIO()
-    w = csv.writer(buf, quoting=csv.QUOTE_NONE, escapechar="\\")
-    quoted = auto_quote(row, quotechar='"', predicate=lambda s: ' ' in s)
-    w.writerow(headers)
-    w.writerow(quoted)
-    buf.seek(0)
-    return buf
 
 # ------------------------------------------------------------
-# Helper: costruzione dinamica PEL per Template Posta
+# Gruppi AD letti dalle chiavi grp_o365_*
 # ------------------------------------------------------------
-def build_dynamic_pel_for_template(pel_items):
-    """
-    Regola:
-    - 'pillole' viene resa come "- canale ...".
-    - Tutte le altre PEL diventano righe sotto "Aggiungere utenza al gruppo Azure".
-    - Ordine = ordine nel foglio Excel.
-    """
-    azure_groups = []
-    pillole_value = ""
+o365_groups = []
 
-    for k, v in pel_items:
-        key = str(k).strip()
-        val = str(v).strip()
-        if not val:
-            continue
+for key, value in defaults.items():
 
-        if key == "pillole":
-            pillole_value = val
-            continue
+    if (
+        str(key).startswith("grp_o365_")
+        and value
+    ):
 
-        azure_groups.append(val)
+        for group in split_values(
+            value
+        ):
 
-    return azure_groups, pillole_value
+            # Correzione automatica nel caso manchi
+            # la O iniziale
+            if group.startswith("365 "):
+
+                group = (
+                    "O"
+                    + group
+                )
+
+            if group not in o365_groups:
+
+                o365_groups.append(
+                    group
+                )
+
 
 # ------------------------------------------------------------
-# Streamlit App
+# Liste di distribuzione previste per interinali
+# Supporta entrambe le possibili chiavi
 # ------------------------------------------------------------
-st.set_page_config(page_title="1.2 Risorsa Esterna: Somministrato/Stage")
-st.title("1.2 Risorsa Esterna: Somministrato/Stage")
+dl_interinale = split_values(
+    defaults.get(
+        "dl_interinale",
+        defaults.get(
+            "dl_somministrato",
+            ""
+        )
+    )
+)
 
-config_file = st.file_uploader("Carica il file di configurazione (config.xlsx)", type=["xlsx"])
-if not config_file:
-    st.warning("Per favore carica il file di configurazione per continuare.")
-    st.stop()
 
-# Carica configurazione
-gruppi, defaults, managers, organigramma, pel_items = load_config_from_bytes(config_file.read())
+# ------------------------------------------------------------
+# Modulo inserimento nuova risorsa esterna
+# ------------------------------------------------------------
+st.subheader(
+    "Modulo Inserimento Nuova Risorsa Esterna: Somministrato/Stage"
+)
 
-# Valori di default (NON CAMBIATI)
-o365_groups = [
-    defaults.get("grp_o365_standard","O365 Utenti Standard"),
-    defaults.get("grp_o365_teams","O365 Teams Premium"),
-    defaults.get("grp_o365_copilot","O365 Copilot Plus")]
-grp_foorban        = defaults.get("grp_foorban","Foorban_Users")
-grp_salesforce     = defaults.get("grp_salesforce", "")  # <-- lettura grp_salesforce
-pillole            = defaults.get("pillole","Pillole formative Teams Premium")
-ou_value           = defaults.get("ou_default","Somministrati e Stage")
-expire_default     = defaults.get("expire_default","30-06-2025")
-department_default = defaults.get("department_default","")
-telephone_default  = defaults.get("telephone_interna","")
-company            = defaults.get("company_interna","")
+colonna_1, colonna_2 = st.columns(2)
 
-# Modulo di input
-st.subheader("Modulo Inserimento Risorsa Esterna: Somministrato/Stage")
-cognome          = st.text_input("Cognome").strip().capitalize()
-secondo_cognome  = st.text_input("Secondo Cognome").strip().capitalize()
-nome             = st.text_input("Nome").strip().capitalize()
-secondo_nome     = st.text_input("Secondo Nome").strip().capitalize()
-codice_fiscale   = st.text_input("Codice Fiscale","" ).strip()
 
-# Dropdown per Sigla Divisione-Area da organigramma
+with colonna_1:
+
+    cognome = (
+        st.text_input(
+            "Cognome"
+        )
+        .strip()
+        .title()
+    )
+
+    secondo_cognome = (
+        st.text_input(
+            "Secondo Cognome"
+        )
+        .strip()
+        .title()
+    )
+
+    nome = (
+        st.text_input(
+            "Nome"
+        )
+        .strip()
+        .title()
+    )
+
+    secondo_nome = (
+        st.text_input(
+            "Secondo Nome"
+        )
+        .strip()
+        .title()
+    )
+
+    codice_fiscale = st.text_input(
+        "Codice Fiscale",
+        ""
+    ).strip()
+
+    # --------------------------------------------------------
+    # Dropdown Manager
+    # --------------------------------------------------------
+    if managers:
+
+        manager_label = st.selectbox(
+            "Manager",
+            [
+                "-- Seleziona --"
+            ]
+            + list(
+                managers.keys()
+            )
+        )
+
+        if manager_label != "-- Seleziona --":
+
+            manager = managers.get(
+                manager_label,
+                ""
+            )
+
+        else:
+
+            manager = ""
+
+    else:
+
+        manager = st.text_input(
+            "Manager"
+        ).strip()
+
+    data_fine = st.text_input(
+        "Data di Fine (gg/mm/aaaa)",
+        defaults.get(
+            "expire_default",
+            ""
+        )
+    ).strip()
+
+
+with colonna_2:
+
+    numero_telefono = (
+        st.text_input(
+            "Mobile (+39 già inserito)",
+            ""
+        )
+        .replace(" ", "")
+        .strip()
+    )
+
+    description = st.text_input(
+        "PC (lascia vuoto per <PC>)",
+        "<PC>"
+    ).strip()
+
+    data_operativa = st.text_input(
+        "Data operatività (gg/mm/aaaa)",
+        ""
+    ).strip()
+
+    mouse_id = st.text_input(
+        "Mouse ID",
+        ""
+    ).strip()
+
+    mouse_sn = st.text_input(
+        "Mouse SN",
+        ""
+    ).strip()
+
+    hub_id = st.text_input(
+        "HUB Sandberg ID",
+        ""
+    ).strip()
+
+
+# ------------------------------------------------------------
+# Dropdown organigramma
+# ------------------------------------------------------------
 if organigramma:
-    dept_label = st.selectbox("Sigla Divisione-Area", options=["-- Seleziona --"] + list(organigramma.keys()))
-    department = organigramma.get(dept_label, "") if dept_label and dept_label != "-- Seleziona --" else department_default
+
+    department_label = st.selectbox(
+        "Sigla Divisione-Area",
+        [
+            "-- Seleziona --"
+        ]
+        + list(
+            organigramma.keys()
+        )
+    )
+
+    if department_label != "-- Seleziona --":
+
+        department = organigramma.get(
+            department_label,
+            ""
+        )
+
+    else:
+
+        department = defaults.get(
+            "department_default",
+            ""
+        )
+
 else:
-    department = st.text_input("Sigla Divisione-Area", department_default).strip()
 
-numero_telefono  = st.text_input("Mobile","" ).replace(" ","")
-description      = st.text_input("PC (lascia vuoto per <PC>)","<PC>" ).strip()
-expire_date      = st.text_input("Data di Fine (gg-mm-aaaa)", expire_default).strip()
-profilazione_flag= st.checkbox("Deve essere profilato su qualche SM?")
-sm_lines         = st.text_area("SM su quali va profilato","" ).splitlines() if profilazione_flag else []
-employee_id      = ""
-inserimento_gruppo= gruppi.get("esterna_stage", "")
-telephone_number = telephone_default
+    department = st.text_input(
+        "Sigla Divisione-Area",
+        defaults.get(
+            "department_default",
+            ""
+        )
+    ).strip()
 
-# Dropdown Manager
-if managers:
-    manager_label = st.selectbox("Manager", options=["-- Seleziona --"] + list(managers.keys()))
-    manager = managers.get(manager_label, "") if manager_label and manager_label != "-- Seleziona --" else ""
-else:
-    manager = st.text_input("Manager").strip()
 
-# Anteprima Messaggio (Template)
-if st.button("Template per Posta Elettronica"):
-    sAM    = genera_samaccountname(nome, cognome, secondo_nome, secondo_cognome, True)
-    cn     = build_full_name(cognome, secondo_cognome, nome, secondo_nome, True)
-    exp_fmt= formatta_data(expire_date)
-    upn    = f"{sAM}@consip.it"
-    mobile = f"+39 {numero_telefono}" if numero_telefono else ""
+# ------------------------------------------------------------
+# Tipologia utente e OU
+# ------------------------------------------------------------
+ou_values = (
+    list(
+        ou_options.values()
+    )
+    if ou_options
+    else []
+)
 
-    st.markdown("""
-Ciao.
-Richiedo la definizione di una casella come sottoindicato.
-""")
-    table_md = f"""
-| Campo             | Valore                                     |
-|-------------------|--------------------------------------------|
-| Tipo Utenza       | Remota                                     |
-| Utenza            | {sAM}                                       |
-| Alias             | {sAM}                                       |
-| Display name      | {cn}                                        |
-| Common name       | {cn}                                        |
-| Manager           | {manager}                                   |
-| e-mail            | {upn}                                       |
-| e-mail secondaria | {upn}                                       |
-| Codice Fiscale    | {codice_fiscale}                            |
-| Data Fine         | {exp_fmt}                                   |
-"""
-    st.markdown(table_md)
-    st.markdown("** il campo \"Data fine\" deve essere inserito in \"Data Assunzione\" **")
+default_ou = defaults.get(
+    "ou_default",
+    (
+        ou_values[0]
+        if ou_values
+        else "Somministrati e Stage"
+    )
+)
 
-    # ✅ NUOVO: PEL dinamici dal config (aggiunte future automatiche)
-    azure_groups, pillole_dyn = build_dynamic_pel_for_template(pel_items)
-    lines = ["Aggiungere utenza al gruppo Azure:"]
-    for g in azure_groups:
-        lines.append(f"- {g}")
-    if pillole_dyn:
-        lines.append(f"- canale {pillole_dyn}")
-    st.markdown("\n".join(lines))
+if ou_values:
 
-    if profilazione_flag:
-        st.markdown("Profilare su SM:")
-        for sm in sm_lines:
-            if sm.strip():
-                st.markdown(f"- {sm}")
-    st.markdown("Grazie  \nSaluti")
+    if default_ou in ou_values:
 
-# Generazione CSV Utente + Computer + Profilazione
-if st.button("Genera CSV Somministrato"):
-    sAM    = genera_samaccountname(nome, cognome, secondo_nome, secondo_cognome, True)
-    cn     = build_full_name(cognome, secondo_cognome, nome, secondo_nome, True)
-    exp_fmt= formatta_data(expire_date)
-    upn    = f"{sAM}@consip.it"
-    mobile = f"+39 {numero_telefono}" if numero_telefono else ""
-    given  = f"{nome} {secondo_nome}".strip()
-    surn   = f"{cognome} {secondo_cognome}".strip()
+        default_index = ou_values.index(
+            default_ou
+        )
 
-    # Costruisci basename normalizzato (visibile nei file)
-    norm_cognome = normalize_name(cognome)
-    norm_secondo = normalize_name(secondo_cognome) if secondo_cognome else ''
-    name_parts = [norm_cognome] + ([norm_secondo] if norm_secondo else []) + [nome[:1].lower()]
-    basename = "_".join(name_parts)
-    name_parts = [cognome] + ([secondo_cognome] if secondo_cognome else []) + [nome[:1]]
-    basename = "_".join(name_parts)
+    else:
 
-    # Righe CSV Utente: InserimentoGruppo lasciato volutamente vuoto come richiesto
-    row_user = [
-        sAM, "SI", ou_value, cn, cn, cn, given, surn,
-        codice_fiscale, employee_id, department, description or "<PC>",
-        "No", exp_fmt, upn, upn, mobile,
-        "", "", "", "", telephone_number, company
-    ]
-    row_comp = [
-        description or "", "", f"{sAM}@consip.it", "", f'"{mobile}"', "",
-        f'"{cn}"', "", "", ""
+        default_index = 0
+
+    label_ou = st.selectbox(
+        "Tipologia Utente",
+        ou_values,
+        index=default_index
+    )
+
+    selected_key = list(
+        ou_options.keys()
+    )[
+        ou_values.index(
+            label_ou
+        )
     ]
 
-    # Profilazione: costruisco lista gruppi unendo o365_groups e inserimento_gruppo (filtrando vuoti)
-    profile_groups_list = []
-    for g in o365_groups:
-        if g and str(g).strip():
-            token = str(g).strip()
-            # Piccola correzione automatica: se per errore manca la "O" iniziale (es. "365 Utenti Standard")
-            if token.startswith("365 "):
-                token = "O" + token
-            profile_groups_list.append(token)
-    if inserimento_gruppo and str(inserimento_gruppo).strip():
-        ig = str(inserimento_gruppo).strip()
-        profile_groups_list.append(ig)
+    ou_value = ou_options[
+        selected_key
+    ]
 
-    # Join senza spazi dopo il punto e virgola (produrra: "A;B;C;d;...")
-    profile_groups = ";".join(profile_groups_list)
+else:
 
-    # Costruisco riga Profilazione con stesso header di HEADER_USER, ma valorizzando solo sAMAccountName e InserimentoGruppo
-    profile_row = [""] * len(HEADER_USER)
-    profile_row[0] = sAM
-    try:
-        idx_inserimento = HEADER_USER.index("InserimentoGruppo")
-    except ValueError:
-        idx_inserimento = 18
-    profile_row[idx_inserimento] = profile_groups
+    selected_key = "esterna_stage"
 
-    # --- Messaggi personalizzati per utente, computer e profilazione ---
-    msg_utente = (
-        "Salve.\n"
-        "Vi richiediamo la definizione della utenza nell\u2019AD Consip come dettagliato nei file:\n"
-        f"\\\\srv_dati\\AreaCondivisa\\DEPSI\\IC\\Utenze\\Esterni\\{basename}_utente.csv\n"
-        "Restiamo in attesa di un vostro riscontro ad attivit\u00e0 completata.\n"
-        "Saluti"
+    ou_value = default_ou
+
+
+# ------------------------------------------------------------
+# Profilazione SM
+# ------------------------------------------------------------
+profilazione = st.checkbox(
+    "Profilazione SM?"
+)
+
+if profilazione:
+
+    sm_lines = [
+        line.strip()
+        for line in st.text_area(
+            "SM (una per riga)",
+            ""
+        ).splitlines()
+        if line.strip()
+    ]
+
+else:
+
+    sm_lines = []
+
+
+# ------------------------------------------------------------
+# Company e numero telefonico
+# ------------------------------------------------------------
+company = defaults.get(
+    "company_esterna",
+    defaults.get(
+        "company_interna",
+        ""
+    )
+)
+
+telephone_number = defaults.get(
+    "telephone_esterna",
+    defaults.get(
+        "telephone_interna",
+        ""
+    )
+)
+
+
+# ------------------------------------------------------------
+# Informazioni specifiche interinale
+# ------------------------------------------------------------
+st.info(
+    "Per le risorse interinali sono sempre previsti "
+    "PC, mouse e HUB. La firma digitale non è prevista "
+    "e non viene generata alcuna attività per MM."
+)
+
+
+# ------------------------------------------------------------
+# Generazione flusso completo
+# ------------------------------------------------------------
+if st.button(
+    "Genera flusso completo",
+    type="primary"
+):
+
+    # --------------------------------------------------------
+    # Validazioni
+    # --------------------------------------------------------
+    if not cognome or not nome:
+
+        st.error(
+            "Inserire almeno Cognome e Nome "
+            "prima di generare i file."
+        )
+
+        st.stop()
+
+    if not data_operativa:
+
+        st.error(
+            "Inserire la Data operatività."
+        )
+
+        st.stop()
+
+    if not data_fine:
+
+        st.error(
+            "Inserire la Data di Fine."
+        )
+
+        st.stop()
+
+    if not manager:
+
+        st.error(
+            "Selezionare o inserire il Manager."
+        )
+
+        st.stop()
+
+    # --------------------------------------------------------
+    # Dati principali
+    # --------------------------------------------------------
+    sam = genera_samaccountname(
+        nome,
+        cognome,
+        secondo_nome,
+        secondo_cognome,
+        True
     )
 
-    msg_computer = (
-        "Salve.\n"
-        "Si richiede modifiche come da file:\n"
-        f"\\\\srv_dati\\AreaCondivisa\\DEPSI\\IC\\PC\\{basename}_computer.csv\n"
-        "Restiamo in attesa di un vostro riscontro ad attivit\u00e0 completata.\n"
-        "Saluti"
+    cn = build_full_name(
+        cognome,
+        secondo_cognome,
+        nome,
+        secondo_nome,
+        True
     )
 
-    msg_profilazione = (
-        "Salve.\n"
-        "Si richiede modifiche come da file:\n"
-        f"\\\\srv_dati\\AreaCondivisa\\DEPSI\\IC\\Profilazioni\\{basename}_profilazione.csv\n"
-        "Restiamo in attesa di un vostro riscontro ad attivit\u00e0 completata.\n"
-        "Saluti"
+    given_name = (
+        f"{nome} {secondo_nome}"
+        .strip()
     )
 
-    # --- mostra a video i messaggi sintetici e le anteprime ---
-    st.subheader(f"Nuova Utenza AD [{cognome} (esterno)]")
-    st.text(msg_utente)
-    st.subheader("Anteprima CSV Utente")
-    st.dataframe(pd.DataFrame([row_user], columns=HEADER_USER))
-
-    # Download CSV Utente (sotto l'anteprima utente)
-    buf_user = make_csv_buffer(HEADER_USER, row_user)
-    st.download_button(
-        "📥 Scarica CSV Utente",
-        data=buf_user.getvalue(),
-        file_name=f"{basename}_utente.csv",
-        mime="text/csv"
+    surname = (
+        f"{cognome} {secondo_cognome}"
+        .strip()
     )
 
-    st.subheader(f"Modifica AD [{cognome} (esterno)]")
-    st.text(msg_computer)
-    st.subheader("Anteprima CSV Computer")
-    st.dataframe(pd.DataFrame([row_comp], columns=HEADER_COMP))
-
-    # Download CSV Computer (sotto l'anteprima computer)
-    buf_comp = make_csv_buffer(HEADER_COMP, row_comp)
-    st.download_button(
-        "📥 Scarica CSV Computer",
-        data=buf_comp.getvalue(),
-        file_name=f"{basename}_computer.csv",
-        mime="text/csv"
+    upn = (
+        f"{sam}@consip.it"
     )
 
-    st.subheader(f"Modifica AD Profilazione [{cognome} (esterno)]")
-    st.text(msg_profilazione)
-    st.subheader("Anteprima CSV Profilazione")
-    st.dataframe(pd.DataFrame([profile_row], columns=HEADER_USER))
+    if numero_telefono:
 
-    # Download CSV Profilazione (sotto l'anteprima profilazione)
-    buf_prof = make_csv_buffer(HEADER_USER, profile_row)
-    st.download_button(
-        "📥 Scarica CSV Profilazione",
-        data=buf_prof.getvalue(),
-        file_name=f"{basename}_profilazione.csv",
-        mime="text/csv"
+        mobile = (
+            f"+39 {numero_telefono}"
+        )
+
+    else:
+
+        mobile = ""
+
+    expire_date_csv = formatta_data(
+        data_fine
     )
 
-    # -------------------------------------------
-    # Preparo l'anteprima template in formato Markdown (da inserire SOLO nello ZIP)
-    # -------------------------------------------
-    table_md = (
-        "| Campo             | Valore                                     |\n"
-        "|-------------------|--------------------------------------------|\n"
-        f"| Tipo Utenza       | Remota                                     |\n"
-        f"| Utenza            | {sAM}                                       |\n"
-        f"| Alias             | {sAM}                                       |\n"
-        f"| Display name      | {cn}                                        |\n"
-        f"| Common name       | {cn}                                        |\n"
-        f"| e-mail            | {upn}                                       |\n"
-        f"| e-mail secondaria | {upn}                                       |\n"
+    persona_nome_file = " ".join(
+        part
+        for part in [
+            cognome,
+            secondo_cognome,
+            nome,
+            secondo_nome
+        ]
+        if part
     )
 
-    template_preview_lines = []
-    template_preview_lines.append("Richiesta definizione casella - anteprima template\n")
-    template_preview_lines.append(table_md)
-    if profile_groups_list:
-        template_preview_lines.append(f"\nIl giorno {expire_date} occorre inserire la casella nelle DL:\n")
-        for dl in profile_groups_list:
-            template_preview_lines.append(f"- {dl}\n")
-    if profilazione_flag:
-        template_preview_lines.append("\nProfilare su SM:\n")
+    persona_nome_underscore = "_".join(
+        part
+        for part in [
+            cognome,
+            secondo_cognome,
+            nome,
+            secondo_nome
+        ]
+        if part
+    )
+
+    pc_asset = (
+        description
+        or "<PC>"
+    )
+
+    data_operativa_output = (
+        data_operativa
+        or "<data inizio>"
+    )
+
+    mouse_id_output = (
+        mouse_id
+        or "#id"
+    )
+
+    mouse_sn_output = (
+        mouse_sn
+        or "#sn"
+    )
+
+    hub_id_output = (
+        hub_id
+        or "#id"
+    )
+
+    # ========================================================
+    # FILE 1 - UTENZA
+    # ========================================================
+    row_utente = [
+        sam,
+        "SI",
+        ou_value,
+        cn,
+        cn,
+        cn,
+        given_name,
+        surname,
+        codice_fiscale,
+        "",
+        department,
+        pc_asset,
+        "No",
+        expire_date_csv,
+        upn,
+        upn,
+        mobile,
+        "",
+        "",
+        "",
+        "",
+        telephone_number,
+        company
+    ]
+
+    csv_utente = prepara_csv_standard(
+        row_utente,
+        HEADER_UTENTE
+    )
+
+    # ========================================================
+    # FILE 2 - CASELLA
+    # ========================================================
+    casella_lines = [
+        "Tipo Utenza --- Remota",
+        f"Utenza --- {sam}",
+        f"Alias --- {sam}",
+        f"Display name --- {cn}",
+        f"Common name --- {cn}",
+        f"Manager --- {manager}",
+        f"e-mail --- {upn}",
+        f"e-mail secondaria --- {upn}",
+        f"Codice Fiscale --- {codice_fiscale}",
+        f"Data Fine --- {expire_date_csv}",
+        "",
+        (
+            'Nota: il campo "Data Fine" deve essere '
+            'inserito in "Data Assunzione".'
+        )
+    ]
+
+    if profilazione and sm_lines:
+
+        casella_lines.append(
+            ""
+        )
+
+        casella_lines.append(
+            "Profilare su SM:"
+        )
+
         for sm in sm_lines:
-            template_preview_lines.append(f"- {sm}\n")
 
-    # ✅ NUOVO: PEL dinamici anche nella preview ZIP (stessa identica logica del template a video)
-    azure_groups, pillole_dyn = build_dynamic_pel_for_template(pel_items)
-    if azure_groups:
-        template_preview_lines.append("\nAggiungere utenza al gruppo Azure:\n")
-        for g in azure_groups:
-            template_preview_lines.append(f"- {g}\n")
-    if pillole_dyn:
-        template_preview_lines.append(f"- canale {pillole_dyn}\n")
+            casella_lines.append(
+                f"- {sm}"
+            )
 
-    # unisco tutto in una stringa markdown
-    template_preview_md = "\n".join(template_preview_lines)
+    csv_casella = (
+        "\n".join(
+            casella_lines
+        )
+        + "\n"
+    )
 
-    # -------------------------------------------
-    # Creo lo ZIP con i 3 CSV + file di anteprima template + 3 messaggi .txt
-    # (i file "msg_*.txt" e "template_preview.md" saranno presenti SOLO nello ZIP)
-    # -------------------------------------------
+    # ========================================================
+    # FILE 3 - PROFILAZIONE GRUPPI AD
+    # ========================================================
+    inserimento_gruppo_value = (
+        gruppi.get(
+            "esterna_stage",
+            ""
+        )
+        or gruppi.get(
+            "somministrato",
+            ""
+        )
+        or gruppi.get(
+            "interinale",
+            ""
+        )
+    )
+
+    gruppi_esterni = []
+
+    for group in split_values(
+        inserimento_gruppo_value
+    ):
+
+        if group.startswith("365 "):
+
+            group = (
+                "O"
+                + group
+            )
+
+        gruppi_esterni.append(
+            group
+        )
+
+    gruppi_ad = unique_in_order(
+        o365_groups
+        + gruppi_esterni
+    )
+
+    row_gruppi_ad = [
+        ""
+    ] * len(
+        HEADER_UTENTE
+    )
+
+    row_gruppi_ad[0] = sam
+
+    inserimento_gruppo_index = (
+        HEADER_UTENTE.index(
+            "InserimentoGruppo"
+        )
+    )
+
+    row_gruppi_ad[
+        inserimento_gruppo_index
+    ] = ";".join(
+        gruppi_ad
+    )
+
+    csv_gruppi_ad = prepara_csv_standard(
+        row_gruppi_ad,
+        HEADER_UTENTE
+    )
+
+    # ========================================================
+    # FILE 4 - PROFILAZIONE GRUPPI ENTRA ID
+    # ========================================================
+    gruppi_entraid = build_entraid_groups(
+        pel_items
+    )
+
+    pillole = get_pillole(
+        pel_items,
+        defaults
+    )
+
+    entra_lines = [
+        (
+            f"Per l'utenza {sam} "
+            "aggiungere i gruppi EntraID:"
+        )
+    ]
+
+    if gruppi_entraid:
+
+        entra_lines.extend(
+            gruppi_entraid
+        )
+
+    else:
+
+        entra_lines.append(
+            "Nessun gruppo EntraID previsto."
+        )
+
+    if pillole:
+
+        entra_lines.append(
+            ""
+        )
+
+        entra_lines.append(
+            f"Aggiungere al canale {pillole}"
+        )
+
+    csv_entraid = (
+        "\n".join(
+            entra_lines
+        )
+        + "\n"
+    )
+
+    # ========================================================
+    # FILE 5 - COMPUTER
+    # Da elaborare alla data operatività
+    # ========================================================
+    row_computer = [
+        pc_asset,
+        "",
+        upn,
+        "",
+        mobile,
+        "",
+        cn,
+        "",
+        "",
+        ""
+    ]
+
+    csv_computer = prepara_csv_standard(
+        row_computer,
+        HEADER_COMPUTER
+    )
+
+    # ========================================================
+    # FILE 6 - LISTE DI DISTRIBUZIONE
+    # Da elaborare alla data operatività
+    # ========================================================
+    dl_lines = [
+        (
+            f"{upn} "
+            f"in data {data_operativa_output} "
+            "inserire nelle DL:"
+        )
+    ]
+
+    if dl_interinale:
+
+        dl_lines.extend(
+            dl_interinale
+        )
+
+    else:
+
+        dl_lines.append(
+            "Nessuna lista di distribuzione prevista."
+        )
+
+    csv_dl = (
+        "\n".join(
+            dl_lines
+        )
+        + "\n"
+    )
+
+    # ========================================================
+    # NOMI FILE
+    # ========================================================
+    filename_utente = (
+        f"1_{persona_nome_file}_utenza.csv"
+    )
+
+    filename_casella = (
+        f"2_{persona_nome_file}_casella.csv"
+    )
+
+    filename_gruppi_ad = (
+        f"3_{persona_nome_file}"
+        "_profilazione_Gruppi_AD.csv"
+    )
+
+    filename_entraid = (
+        f"4_{persona_nome_file}"
+        "_profilazione_Gruppi_EntraID.csv"
+    )
+
+    filename_computer = (
+        f"5_{persona_nome_underscore}"
+        "_computer.csv"
+    )
+
+    filename_dl = (
+        f"6_{persona_nome_file}_DL.csv"
+    )
+
+    # ========================================================
+    # 01 - GSI
+    # ASSEGNAZIONE ASSET
+    # ========================================================
+    subject_gsi = (
+        "01 - Assegnazione Asset - "
+        f"{cn} → GSI"
+    )
+
+    message_gsi = (
+        f"Per la nuova risorsa interinale {cn} "
+        "assegnare i seguenti asset:\n"
+        f"- PC Nome asset {pc_asset}\n"
+        f"- mouse ID {mouse_id_output} "
+        f"e SN {mouse_sn_output}\n"
+        f"- HUB Sandberg ID {hub_id_output}"
+    )
+
+    # ========================================================
+    # 02 - GIIT
+    # Provisioning Utente + Computer + DL
+    # ========================================================
+    subject_giit = (
+        "02 - Provisioning Utente "
+        "(utenza/Casella/Profilazione) + "
+        "Modifica AD Computer + "
+        "Liste di Distribuzione - "
+        f"{cn} → GIIT"
+    )
+
+    message_giit = (
+        "Ciao,\n"
+        "si richiede di elaborare i file contenuti "
+        "nella cartella compressa .zip "
+        "nel seguente ordine:\n"
+        f"1. {filename_utente} per la creazione "
+        "di un'utenza On prem su AD\n"
+        f"2. {filename_casella} per la creazione "
+        "di un'utenza ibrida come indicato\n"
+        f"3. {filename_gruppi_ad} per inserimento "
+        "dei gruppi AD\n"
+        f"4. {filename_entraid} per inserimento "
+        "dei gruppi EntraID\n"
+        f"5. {filename_computer} per Aggiornamento "
+        "Computer su AD con riferimenti utente, "
+        f"effettuare questa attività il giorno "
+        f"{data_operativa_output}.\n"
+        f"6. {filename_dl} per l'inserimento nelle "
+        "Liste di Distribuzione, "
+        f"effettuare questa attività il giorno "
+        f"{data_operativa_output}."
+    )
+
+    # ========================================================
+    # 03 - GHDW
+    # Provisioning PC + Firma Asset
+    # ========================================================
+    subject_ghdw = (
+        "03 - Provisioning PC e Firma Asset - "
+        f"{cn} → GHDW"
+    )
+
+    message_ghdw = (
+        "Ciao,\n"
+        f"per {cn} ritirare dal 599 "
+        "per CONFIGURAZIONE i seguenti asset:\n"
+        f"- PC Nome asset {pc_asset}\n"
+        f"- mouse ID {mouse_id_output} "
+        f"e SN {mouse_sn_output}\n"
+        f"- HUB Sandberg ID {hub_id_output}\n"
+        "\n"
+        f"La risorsa prende servizio "
+        f"{data_operativa_output}.\n"
+        "\n"
+        "Attività da effettuare:\n"
+        "1. Configurare gli asset indicati.\n"
+        f"2. Il giorno {data_operativa_output} "
+        "far firmare gli asset ritirati dal 599 "
+        f"per la consegna a {cn}."
+    )
+
+    # ========================================================
+    # 04 - GA
+    # Foto + SIC + Accesso intranet PSN
+    # ========================================================
+    subject_ga = (
+        "04 - Caricamento Foto, Verifica SIC e "
+        "Accesso intranet PSN - "
+        f"{cn} → GA"
+    )
+
+    message_ga = (
+        "Ciao,\n"
+        "si richiedono le seguenti attività:\n"
+        f"1. Caricare la foto in allegato per {cn}.\n"
+        f"2. Verificare che per l'utente {cn} "
+        "sia indicata sul SIC la seguente email: "
+        f'"{upn}".\n'
+        "3. Accesso intranet PSN: attività "
+        "momentaneamente esclusa dal flusso, "
+        "perché attualmente gestita via email."
+    )
+
+    # ========================================================
+    # FIRMA DIGITALE
+    # Non prevista per gli interinali.
+    # Non viene generata alcuna attività per MM.
+    # ========================================================
+
+    # ========================================================
+    # GUIDA COMPLETA
+    # ========================================================
+    guida_flusso_lines = [
+        subject_gsi,
+        message_gsi,
+
+        subject_giit,
+        message_giit,
+
+        subject_ghdw,
+        message_ghdw,
+
+        subject_ga,
+        message_ga
+    ]
+
+    guida_flusso = "\n\n".join(
+        guida_flusso_lines
+    )
+
+    filename_guida = (
+        f"Guida_Flusso_"
+        f"{persona_nome_underscore}.txt"
+    )
+
+    # ========================================================
+    # CREAZIONE BUNDLE ZIP
+    # ========================================================
     zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zipf:
-        # CSV
-        zipf.writestr(f"{basename}_utente.csv", buf_user.getvalue())
-        zipf.writestr(f"{basename}_computer.csv", buf_comp.getvalue())
-        zipf.writestr(f"{basename}_profilazione.csv", buf_prof.getvalue())
-        # anteprima template (markdown)
-        zipf.writestr(f"{basename}_template_preview.md", template_preview_md)
-        # messaggi (solo testo)
-        zipf.writestr(f"{basename}_msg_utente.txt", msg_utente)
-        zipf.writestr(f"{basename}_msg_computer.txt", msg_computer)
-        zipf.writestr(f"{basename}_msg_profilazione.txt", msg_profilazione)
+
+    with zipfile.ZipFile(
+        zip_buffer,
+        "w",
+        zipfile.ZIP_DEFLATED
+    ) as zip_file:
+
+        zip_file.writestr(
+            filename_utente,
+            csv_utente
+        )
+
+        zip_file.writestr(
+            filename_casella,
+            csv_casella
+        )
+
+        zip_file.writestr(
+            filename_gruppi_ad,
+            csv_gruppi_ad
+        )
+
+        zip_file.writestr(
+            filename_entraid,
+            csv_entraid
+        )
+
+        zip_file.writestr(
+            filename_computer,
+            csv_computer
+        )
+
+        zip_file.writestr(
+            filename_dl,
+            csv_dl
+        )
+
+        zip_file.writestr(
+            filename_guida,
+            guida_flusso
+        )
 
     zip_buffer.seek(0)
 
-    # pulsante per scaricare l'unico ZIP (contenente anche template + messaggi)
-    st.download_button(
-        "📦 Scarica Tutti i CSV (ZIP) + anteprima e messaggi",
-        data=zip_buffer.getvalue(),
-        file_name=f"{basename}_csv_bundle.zip",
-        mime="application/zip"
+    bundle_name = (
+        f"Provisioning_Interinale_"
+        f"{persona_nome_underscore}.zip"
     )
 
-    st.success(f"✅ CSV generati per '{sAM}'")
+    # ========================================================
+    # VISUALIZZAZIONE DEL FLUSSO
+    # ========================================================
+
+    # ========================================================
+    # 01 - GSI
+    # ========================================================
+    st.subheader(
+        subject_gsi
+    )
+
+    st.text(
+        message_gsi
+    )
+
+    st.divider()
+
+    # ========================================================
+    # 02 - GIIT
+    # ========================================================
+    st.subheader(
+        subject_giit
+    )
+
+    st.text(
+        message_giit
+    )
+
+    st.markdown(
+        "**File di competenza GIIT:**"
+    )
+
+    # --------------------------------------------------------
+    # File 1 - Utenza
+    # --------------------------------------------------------
+    st.markdown(
+        f"**1. {filename_utente}**"
+    )
+
+    st.dataframe(
+        pd.DataFrame(
+            [
+                row_utente
+            ],
+            columns=HEADER_UTENTE
+        ),
+        use_container_width=True
+    )
+
+    st.download_button(
+        "Scarica 1 - Utenza",
+        data=csv_utente,
+        file_name=filename_utente,
+        mime="text/csv",
+        key="download_utente"
+    )
+
+    # --------------------------------------------------------
+    # File 2 - Casella
+    # --------------------------------------------------------
+    st.markdown(
+        f"**2. {filename_casella}**"
+    )
+
+    st.text(
+        csv_casella
+    )
+
+    st.download_button(
+        "Scarica 2 - Casella",
+        data=csv_casella,
+        file_name=filename_casella,
+        mime="text/csv",
+        key="download_casella"
+    )
+
+    # --------------------------------------------------------
+    # File 3 - Gruppi AD
+    # --------------------------------------------------------
+    st.markdown(
+        f"**3. {filename_gruppi_ad}**"
+    )
+
+    st.dataframe(
+        pd.DataFrame(
+            [
+                row_gruppi_ad
+            ],
+            columns=HEADER_UTENTE
+        ),
+        use_container_width=True
+    )
+
+    st.download_button(
+        "Scarica 3 - Gruppi AD",
+        data=csv_gruppi_ad,
+        file_name=filename_gruppi_ad,
+        mime="text/csv",
+        key="download_gruppi_ad"
+    )
+
+    # --------------------------------------------------------
+    # File 4 - Gruppi Entra ID
+    # --------------------------------------------------------
+    st.markdown(
+        f"**4. {filename_entraid}**"
+    )
+
+    st.text(
+        csv_entraid
+    )
+
+    st.download_button(
+        "Scarica 4 - Gruppi Entra ID",
+        data=csv_entraid,
+        file_name=filename_entraid,
+        mime="text/csv",
+        key="download_entraid"
+    )
+
+    # --------------------------------------------------------
+    # File 5 - Computer
+    # --------------------------------------------------------
+    st.markdown(
+        f"**5. {filename_computer}**"
+    )
+
+    st.info(
+        f"Il file deve essere elaborato il giorno "
+        f"{data_operativa_output}."
+    )
+
+    st.dataframe(
+        pd.DataFrame(
+            [
+                row_computer
+            ],
+            columns=HEADER_COMPUTER
+        ),
+        use_container_width=True
+    )
+
+    st.download_button(
+        "Scarica 5 - Computer",
+        data=csv_computer,
+        file_name=filename_computer,
+        mime="text/csv",
+        key="download_computer"
+    )
+
+    # --------------------------------------------------------
+    # File 6 - Liste di distribuzione
+    # --------------------------------------------------------
+    st.markdown(
+        f"**6. {filename_dl}**"
+    )
+
+    st.info(
+        f"Il file deve essere elaborato il giorno "
+        f"{data_operativa_output}."
+    )
+
+    st.text(
+        csv_dl
+    )
+
+    st.download_button(
+        "Scarica 6 - Liste di Distribuzione",
+        data=csv_dl,
+        file_name=filename_dl,
+        mime="text/csv",
+        key="download_dl"
+    )
+
+    # --------------------------------------------------------
+    # Bundle completo
+    # --------------------------------------------------------
+    st.markdown(
+        "**Bundle completo del provisioning:**"
+    )
+
+    st.download_button(
+        "📦 Scarica bundle completo ZIP",
+        data=zip_buffer.getvalue(),
+        file_name=bundle_name,
+        mime="application/zip",
+        key="download_bundle"
+    )
+
+    st.divider()
+
+    # ========================================================
+    # 03 - GHDW
+    # ========================================================
+    st.subheader(
+        subject_ghdw
+    )
+
+    st.text(
+        message_ghdw
+    )
+
+    st.divider()
+
+    # ========================================================
+    # 04 - GA
+    # ========================================================
+    st.subheader(
+        subject_ga
+    )
+
+    st.text(
+        message_ga
+    )
+
+    st.divider()
+
+    # ========================================================
+    # FIRMA DIGITALE NON PREVISTA
+    # ========================================================
+    st.info(
+        "Firma digitale non prevista per le risorse "
+        "interinali. Nessuna attività MM generata."
+    )
+
+    st.success(
+        f"Flusso completo generato correttamente "
+        f"per '{sam}'."
+    )
